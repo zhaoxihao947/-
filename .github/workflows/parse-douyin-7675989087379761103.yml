@@ -1,12 +1,21 @@
 name: Parse Douyin 7675989087379761103
 
 on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/trigger/**"
   push:
+    branches:
+      - master
     paths:
       - ".github/workflows/parse-douyin-7675989087379761103.yml"
+      - ".github/trigger/**"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   VIDEO_ID: "7675989087379761103"
@@ -17,67 +26,84 @@ jobs:
   parse-transcribe:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+
     steps:
       - name: Checkout scratch repository
         uses: actions/checkout@v4
 
       - name: Install runtime dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg jq
 
-      - name: Parse Douyin metadata with maintained parser
-        id: parse
+      - name: Parse Douyin metadata
         shell: bash
         run: |
           set -euo pipefail
           rm -rf /tmp/parse-video
           git clone --depth 1 https://github.com/wujunwei928/parse-video.git /tmp/parse-video
           mkdir -p "$OUT_DIR"
-          cd /tmp/parse-video
+
           set +e
-          go run . id --source douyin --format json "$VIDEO_ID" > "$GITHUB_WORKSPACE/$OUT_DIR/metadata.json" 2> "$GITHUB_WORKSPACE/$OUT_DIR/parser.stderr.txt"
-          code=$?
+          (
+            cd /tmp/parse-video
+            go run . id --source douyin --format json "$VIDEO_ID"
+          ) > "$OUT_DIR/metadata.json" 2> "$OUT_DIR/parser.stderr.txt"
+          parser_code=$?
           set -e
-          echo "parser_exit_code=$code"
-          cat "$GITHUB_WORKSPACE/$OUT_DIR/parser.stderr.txt" || true
-          cat "$GITHUB_WORKSPACE/$OUT_DIR/metadata.json" || true
-          if [ "$code" -ne 0 ] || ! jq -e '.video_url and (.video_url | length > 0)' "$GITHUB_WORKSPACE/$OUT_DIR/metadata.json" >/dev/null 2>&1; then
-            echo "Go parser did not return a usable video URL; trying yt-dlp fallback."
+
+          echo "parser_exit_code=$parser_code"
+          cat "$OUT_DIR/parser.stderr.txt" || true
+          cat "$OUT_DIR/metadata.json" || true
+
+          if [ "$parser_code" -ne 0 ] || ! jq -e '.video_url and (.video_url | length > 0)' "$OUT_DIR/metadata.json" >/dev/null 2>&1; then
+            echo "Maintained Go parser did not return a usable media URL; trying yt-dlp."
             python -m pip install -q --upgrade yt-dlp
-            yt-dlp --no-playlist --dump-single-json "$SHARE_URL" > "$GITHUB_WORKSPACE/$OUT_DIR/ytdlp-info.json"
+            yt-dlp --no-playlist --dump-single-json "$SHARE_URL" > "$OUT_DIR/ytdlp-info.json"
             python - <<'PY'
-          import json, os, pathlib
-          out = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / os.environ['OUT_DIR']
-          info = json.loads((out / 'ytdlp-info.json').read_text(encoding='utf-8'))
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["OUT_DIR"])
+          info = json.loads((out / "ytdlp-info.json").read_text(encoding="utf-8"))
           selected = {
-              'author': {
-                  'uid': info.get('uploader_id') or info.get('channel_id') or '',
-                  'name': info.get('uploader') or info.get('channel') or '',
-                  'avatar': info.get('thumbnail') or '',
+              "author": {
+                  "uid": info.get("uploader_id") or info.get("channel_id") or "",
+                  "name": info.get("uploader") or info.get("channel") or "",
+                  "avatar": info.get("thumbnail") or "",
               },
-              'title': info.get('description') or info.get('title') or '',
-              'video_url': info.get('url') or '',
-              'music_url': '',
-              'cover_url': info.get('thumbnail') or '',
-              'duration': info.get('duration'),
-              'webpage_url': info.get('webpage_url') or '',
+              "title": info.get("description") or info.get("title") or "",
+              "video_url": info.get("url") or "",
+              "music_url": "",
+              "cover_url": info.get("thumbnail") or "",
+              "duration": info.get("duration"),
+              "webpage_url": info.get("webpage_url") or "",
           }
-          (out / 'metadata.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / "metadata.json").write_text(
+              json.dumps(selected, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
           PY
           fi
+
+          jq -e '.video_url and (.video_url | length > 0)' "$OUT_DIR/metadata.json" >/dev/null
 
       - name: Download resolved video
         shell: bash
         run: |
           set -euo pipefail
-          VIDEO_URL="$(jq -r '.video_url' "$OUT_DIR/metadata.json")"
-          test -n "$VIDEO_URL" && test "$VIDEO_URL" != "null"
+          video_url="$(jq -r '.video_url' "$OUT_DIR/metadata.json")"
           curl -L --fail --retry 4 --retry-delay 2 \
             -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1' \
             -e 'https://www.douyin.com/' \
-            "$VIDEO_URL" -o "$OUT_DIR/video.mp4"
-          ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate \
+            "$video_url" \
+            -o "$OUT_DIR/video.mp4"
+
+          ffprobe -v error \
+            -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate \
             -of json "$OUT_DIR/video.mp4" > "$OUT_DIR/ffprobe.json"
           cat "$OUT_DIR/ffprobe.json"
 
@@ -86,15 +112,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$OUT_DIR/frames"
-          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" \
-            -vn -ac 1 -ar 16000 "$OUT_DIR/audio.wav"
-          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" \
-            -vf "fps=1/3,scale='min(960,iw)':-2" -q:v 2 "$OUT_DIR/frames/frame_%04d.jpg"
-          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" \
-            -vf "fps=1/3,scale=480:-2,tile=4x5:padding=8:margin=8" -frames:v 1 "$OUT_DIR/contact-sheet.jpg" || true
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "$OUT_DIR/video.mp4" \
+            -vn -ac 1 -ar 16000 \
+            "$OUT_DIR/audio.wav"
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "$OUT_DIR/video.mp4" \
+            -vf "fps=1/2,scale='min(1080,iw)':-2" \
+            -q:v 2 \
+            "$OUT_DIR/frames/frame_%04d.jpg"
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "$OUT_DIR/video.mp4" \
+            -vf "fps=1/3,scale=420:-2,tile=4x5:padding=8:margin=8" \
+            -frames:v 1 \
+            "$OUT_DIR/contact-sheet.jpg" || true
+
           find "$OUT_DIR/frames" -type f | sort > "$OUT_DIR/frame-list.txt"
 
-      - name: Transcribe Chinese speech with Whisper
+      - name: Transcribe Chinese speech
         shell: bash
         run: |
           set -euo pipefail
@@ -107,34 +145,18 @@ jobs:
             --output_dir "$OUT_DIR" \
             --output_format all \
             --verbose True 2>&1 | tee "$OUT_DIR/whisper.log"
-          if [ -f "$OUT_DIR/audio.txt" ]; then
-            cp "$OUT_DIR/audio.txt" "$OUT_DIR/transcript.txt"
-          fi
-          if [ -f "$OUT_DIR/audio.srt" ]; then
-            cp "$OUT_DIR/audio.srt" "$OUT_DIR/transcript.srt"
-          fi
+
+          cp "$OUT_DIR/audio.txt" "$OUT_DIR/transcript.txt"
+          cp "$OUT_DIR/audio.srt" "$OUT_DIR/transcript.srt"
+
           echo "===== TRANSCRIPT START ====="
-          cat "$OUT_DIR/transcript.txt" || true
+          cat "$OUT_DIR/transcript.txt"
           echo "===== TRANSCRIPT END ====="
 
-      - name: Commit metadata, transcript and visual index
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f "$OUT_DIR/audio.wav" "$OUT_DIR/video.mp4"
-          # Keep a limited visual sample in Git; the full video remains only in the workflow artifact.
-          find "$OUT_DIR/frames" -type f | sort | awk 'NR % 2 == 0 {print}' | xargs -r rm -f
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$OUT_DIR"
-          git commit -m "Add parsed transcript for Douyin $VIDEO_ID" || true
-          git push
-
-      - name: Upload complete evidence artifact
+      - name: Upload complete evidence package
         uses: actions/upload-artifact@v4
         with:
           name: douyin-7675989087379761103-evidence
-          path: |
-            outputs/7675989087379761103
+          path: outputs/7675989087379761103
           if-no-files-found: error
           retention-days: 3
