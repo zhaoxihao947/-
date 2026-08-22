@@ -1,2 +1,2 @@
-Run the target-API public video extraction workflow for aweme 7675989087379761103.
-Attempt: 3
+Probe independent resolver endpoints for aweme 7675989087379761103.
+Attempt: 4
