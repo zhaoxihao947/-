@@ -25,82 +25,369 @@ env:
 jobs:
   parse-transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: Checkout scratch repository
         uses: actions/checkout@v4
 
-      - name: Install runtime dependencies
+      - name: Install media and browser dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg jq
+          sudo apt-get install -y -qq ffmpeg jq xvfb
+          google-chrome --version
+          python -m pip install -q --upgrade playwright requests
 
-      - name: Parse Douyin metadata
+      - name: Render Douyin page and extract video source
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf /tmp/parse-video
-          git clone --depth 1 https://github.com/wujunwei928/parse-video.git /tmp/parse-video
           mkdir -p "$OUT_DIR"
 
-          set +e
-          (
-            cd /tmp/parse-video
-            go run . id --source douyin --format json "$VIDEO_ID"
-          ) > "$OUT_DIR/metadata.json" 2> "$OUT_DIR/parser.stderr.txt"
-          parser_code=$?
-          set -e
-
-          echo "parser_exit_code=$parser_code"
-          cat "$OUT_DIR/parser.stderr.txt" || true
-          cat "$OUT_DIR/metadata.json" || true
-
-          if [ "$parser_code" -ne 0 ] || ! jq -e '.video_url and (.video_url | length > 0)' "$OUT_DIR/metadata.json" >/dev/null 2>&1; then
-            echo "Maintained Go parser did not return a usable media URL; trying yt-dlp."
-            python -m pip install -q --upgrade yt-dlp
-            yt-dlp --no-playlist --dump-single-json "$SHARE_URL" > "$OUT_DIR/ytdlp-info.json"
-            python - <<'PY'
+          cat > /tmp/extract_douyin.py <<'PY'
+          import html as html_lib
           import json
           import os
+          import re
+          import sys
+          import time
           from pathlib import Path
+          from urllib.parse import unquote
 
+          import requests
+          from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+          from playwright.sync_api import sync_playwright
+
+          video_id = os.environ["VIDEO_ID"]
+          share_url = os.environ["SHARE_URL"]
           out = Path(os.environ["OUT_DIR"])
-          info = json.loads((out / "ytdlp-info.json").read_text(encoding="utf-8"))
-          selected = {
-              "author": {
-                  "uid": info.get("uploader_id") or info.get("channel_id") or "",
-                  "name": info.get("uploader") or info.get("channel") or "",
-                  "avatar": info.get("thumbnail") or "",
+          out.mkdir(parents=True, exist_ok=True)
+
+          desktop_ua = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/151.0.0.0 Safari/537.36"
+          )
+          mobile_ua = (
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+              "Version/18.6 Mobile/15E148 Safari/604.1"
+          )
+
+          attempts = [
+              {
+                  "name": "desktop-video-page",
+                  "url": f"https://www.douyin.com/video/{video_id}",
+                  "ua": desktop_ua,
+                  "viewport": {"width": 1440, "height": 1000},
+                  "mobile": False,
               },
-              "title": info.get("description") or info.get("title") or "",
-              "video_url": info.get("url") or "",
-              "music_url": "",
-              "cover_url": info.get("thumbnail") or "",
-              "duration": info.get("duration"),
-              "webpage_url": info.get("webpage_url") or "",
-          }
-          (out / "metadata.json").write_text(
-              json.dumps(selected, ensure_ascii=False, indent=2),
+              {
+                  "name": "mobile-share-page",
+                  "url": f"https://www.iesdouyin.com/share/video/{video_id}",
+                  "ua": mobile_ua,
+                  "viewport": {"width": 430, "height": 932},
+                  "mobile": True,
+              },
+              {
+                  "name": "mobile-short-link",
+                  "url": share_url,
+                  "ua": mobile_ua,
+                  "viewport": {"width": 430, "height": 932},
+                  "mobile": True,
+              },
+          ]
+
+          media_candidates = []
+          page_records = []
+          all_cookies = []
+
+          def add_candidate(url, source, content_type=""):
+              if not isinstance(url, str):
+                  return
+              url = html_lib.unescape(url).replace("\\u0026", "&").replace("\\/", "/").strip()
+              try:
+                  url = unquote(url)
+              except Exception:
+                  pass
+              if url.startswith("//"):
+                  url = "https:" + url
+              if not url.startswith(("http://", "https://")):
+                  return
+              lower = url.lower()
+              if any(ext in lower for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg")):
+                  return
+              score = 0
+              if "douyinvod" in lower or "bytevcloudvod" in lower or "douyinstatic" in lower:
+                  score += 6
+              if any(token in lower for token in ("/video/", "play_addr", "playwm", ".mp4", ".m3u8")):
+                  score += 4
+              if content_type.lower().startswith("video/"):
+                  score += 8
+              if source.startswith("dom-video"):
+                  score += 10
+              media_candidates.append(
+                  {
+                      "url": url,
+                      "source": source,
+                      "content_type": content_type,
+                      "score": score,
+                  }
+              )
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=False,
+                  executable_path="/usr/bin/google-chrome",
+                  args=[
+                      "--no-sandbox",
+                      "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--autoplay-policy=no-user-gesture-required",
+                      "--lang=zh-CN",
+                  ],
+              )
+
+              for attempt in attempts:
+                  context = browser.new_context(
+                      user_agent=attempt["ua"],
+                      locale="zh-CN",
+                      timezone_id="Asia/Shanghai",
+                      viewport=attempt["viewport"],
+                      is_mobile=attempt["mobile"],
+                      has_touch=attempt["mobile"],
+                      device_scale_factor=2 if attempt["mobile"] else 1,
+                      extra_http_headers={
+                          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+                      },
+                  )
+                  context.add_init_script(
+                      "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                  )
+                  page = context.new_page()
+                  network_urls = []
+
+                  def on_response(response):
+                      try:
+                          content_type = response.headers.get("content-type", "")
+                          resource_type = response.request.resource_type
+                          url = response.url
+                          network_urls.append(
+                              {
+                                  "url": url,
+                                  "status": response.status,
+                                  "resource_type": resource_type,
+                                  "content_type": content_type,
+                              }
+                          )
+                          if resource_type == "media" or content_type.lower().startswith("video/"):
+                              add_candidate(url, f"network-{attempt['name']}", content_type)
+                      except Exception:
+                          pass
+
+                  page.on("response", on_response)
+                  record = {
+                      "name": attempt["name"],
+                      "requested_url": attempt["url"],
+                      "final_url": "",
+                      "title": "",
+                      "description": "",
+                      "video_elements": [],
+                      "error": "",
+                  }
+
+                  try:
+                      page.goto(attempt["url"], wait_until="domcontentloaded", timeout=120000)
+                      page.wait_for_timeout(12000)
+                      try:
+                          page.keyboard.press("Escape")
+                      except Exception:
+                          pass
+                      try:
+                          page.mouse.wheel(0, 500)
+                          page.wait_for_timeout(2500)
+                      except Exception:
+                          pass
+
+                      record["final_url"] = page.url
+                      record["title"] = page.title()
+                      record["description"] = page.locator('meta[name="description"]').get_attribute("content") or ""
+
+                      elements = page.locator("video")
+                      for index in range(elements.count()):
+                          element = elements.nth(index)
+                          info = element.evaluate(
+                              """el => ({
+                                  src: el.getAttribute('src') || '',
+                                  currentSrc: el.currentSrc || '',
+                                  poster: el.poster || '',
+                                  readyState: el.readyState,
+                                  duration: Number.isFinite(el.duration) ? el.duration : null,
+                                  paused: el.paused
+                              })"""
+                          )
+                          record["video_elements"].append(info)
+                          add_candidate(info.get("currentSrc", ""), f"dom-video-currentSrc-{attempt['name']}")
+                          add_candidate(info.get("src", ""), f"dom-video-src-{attempt['name']}")
+                          try:
+                              element.evaluate("el => { el.muted = true; return el.play(); }")
+                          except Exception:
+                              pass
+
+                      page.wait_for_timeout(5000)
+                      for index in range(elements.count()):
+                          element = elements.nth(index)
+                          try:
+                              current_src = element.evaluate("el => el.currentSrc || el.src || ''")
+                              add_candidate(current_src, f"dom-video-after-play-{attempt['name']}")
+                          except Exception:
+                              pass
+
+                      source_elements = page.locator("video source")
+                      for index in range(source_elements.count()):
+                          src = source_elements.nth(index).get_attribute("src") or ""
+                          add_candidate(src, f"dom-source-{attempt['name']}")
+
+                      page_html = page.content()
+                      (out / f"{attempt['name']}.html").write_text(page_html, encoding="utf-8")
+                      page.screenshot(
+                          path=str(out / f"{attempt['name']}.png"),
+                          full_page=True,
+                      )
+
+                      escaped_patterns = [
+                          r'https?:\\?/\\?/[^"\'<>\s]+',
+                          r'https?://[^"\'<>\s]+',
+                      ]
+                      for pattern in escaped_patterns:
+                          for candidate in re.findall(pattern, page_html):
+                              lower = candidate.lower()
+                              if any(token in lower for token in ("douyinvod", "bytevcloudvod", ".mp4", ".m3u8", "play_addr")):
+                                  add_candidate(candidate, f"html-regex-{attempt['name']}")
+
+                  except PlaywrightTimeoutError as exc:
+                      record["error"] = f"timeout: {exc}"
+                  except Exception as exc:
+                      record["error"] = f"{type(exc).__name__}: {exc}"
+                  finally:
+                      (out / f"{attempt['name']}-network.json").write_text(
+                          json.dumps(network_urls, ensure_ascii=False, indent=2),
+                          encoding="utf-8",
+                      )
+                      cookies = context.cookies()
+                      all_cookies.extend(cookies)
+                      page_records.append(record)
+                      context.close()
+
+              browser.close()
+
+          dedup = {}
+          for item in media_candidates:
+              url = item["url"]
+              existing = dedup.get(url)
+              if existing is None or item["score"] > existing["score"]:
+                  dedup[url] = item
+          ordered = sorted(dedup.values(), key=lambda item: item["score"], reverse=True)
+
+          (out / "browser-pages.json").write_text(
+              json.dumps(page_records, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
+          (out / "media-candidates.json").write_text(
+              json.dumps(ordered, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          (out / "browser-cookies.json").write_text(
+              json.dumps(all_cookies, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          cookie_map = {}
+          for cookie in all_cookies:
+              cookie_map[cookie.get("name", "")] = cookie.get("value", "")
+          cookie_header = "; ".join(f"{key}={value}" for key, value in cookie_map.items() if key)
+          (out / "cookie-header.txt").write_text(cookie_header, encoding="utf-8")
+
+          metadata = {
+              "video_id": video_id,
+              "share_url": share_url,
+              "page_records": page_records,
+              "video_url": ordered[0]["url"] if ordered else "",
+              "candidate_count": len(ordered),
+          }
+          (out / "metadata.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          if not ordered:
+              print("No browser-rendered media URL was found", file=sys.stderr)
+              sys.exit(2)
+
+          session = requests.Session()
+          session.headers.update(
+              {
+                  "User-Agent": desktop_ua,
+                  "Referer": f"https://www.douyin.com/video/{video_id}",
+                  "Accept": "*/*",
+              }
+          )
+          for cookie in all_cookies:
+              try:
+                  session.cookies.set(
+                      cookie.get("name", ""),
+                      cookie.get("value", ""),
+                      domain=cookie.get("domain") or None,
+                      path=cookie.get("path") or "/",
+                  )
+              except Exception:
+                  pass
+
+          failures = []
+          for index, candidate in enumerate(ordered, start=1):
+              url = candidate["url"]
+              if url.lower().endswith(".m3u8") or ".m3u8?" in url.lower():
+                  continue
+              try:
+                  with session.get(url, stream=True, timeout=(20, 120), allow_redirects=True) as response:
+                      content_type = response.headers.get("content-type", "")
+                      if response.status_code != 200:
+                          failures.append({"url": url, "status": response.status_code, "content_type": content_type})
+                          continue
+                      target = out / "video.mp4"
+                      size = 0
+                      with target.open("wb") as handle:
+                          for chunk in response.iter_content(chunk_size=1024 * 1024):
+                              if chunk:
+                                  handle.write(chunk)
+                                  size += len(chunk)
+                      if size > 100_000:
+                          metadata["selected_candidate"] = candidate
+                          metadata["downloaded_bytes"] = size
+                          metadata["download_content_type"] = content_type
+                          (out / "metadata.json").write_text(
+                              json.dumps(metadata, ensure_ascii=False, indent=2),
+                              encoding="utf-8",
+                          )
+                          print(f"Downloaded {size} bytes from candidate {index}")
+                          sys.exit(0)
+                      target.unlink(missing_ok=True)
+                  failures.append({"url": url, "status": "too-small"})
+              except Exception as exc:
+                  failures.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+
+          (out / "download-failures.json").write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print("Media URLs were found, but direct download failed", file=sys.stderr)
+          sys.exit(3)
           PY
-          fi
 
-          jq -e '.video_url and (.video_url | length > 0)' "$OUT_DIR/metadata.json" >/dev/null
-
-      - name: Download resolved video
-        shell: bash
-        run: |
-          set -euo pipefail
-          video_url="$(jq -r '.video_url' "$OUT_DIR/metadata.json")"
-          curl -L --fail --retry 4 --retry-delay 2 \
-            -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1' \
-            -e 'https://www.douyin.com/' \
-            "$video_url" \
-            -o "$OUT_DIR/video.mp4"
+          xvfb-run -a python /tmp/extract_douyin.py 2>&1 | tee "$OUT_DIR/browser-extract.log"
+          test -s "$OUT_DIR/video.mp4"
 
           ffprobe -v error \
             -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate \
@@ -154,6 +441,7 @@ jobs:
           echo "===== TRANSCRIPT END ====="
 
       - name: Upload complete evidence package
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: douyin-7675989087379761103-evidence
