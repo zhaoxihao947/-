@@ -25,7 +25,7 @@ env:
 jobs:
   parse-transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout scratch repository
@@ -40,24 +40,22 @@ jobs:
           google-chrome --version
           python -m pip install -q --upgrade playwright requests
 
-      - name: Render Douyin page and extract video source
+      - name: Capture target API response and download validated media
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$OUT_DIR"
 
-          cat > /tmp/extract_douyin.py <<'PY'
-          import html as html_lib
+          cat > /tmp/capture_target.py <<'PY'
           import json
           import os
-          import re
+          import shutil
+          import subprocess
           import sys
-          import time
           from pathlib import Path
           from urllib.parse import unquote
 
           import requests
-          from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
           from playwright.sync_api import sync_playwright
 
           video_id = os.environ["VIDEO_ID"]
@@ -78,14 +76,14 @@ jobs:
 
           attempts = [
               {
-                  "name": "desktop-video-page",
+                  "name": "desktop",
                   "url": f"https://www.douyin.com/video/{video_id}",
                   "ua": desktop_ua,
                   "viewport": {"width": 1440, "height": 1000},
                   "mobile": False,
               },
               {
-                  "name": "mobile-share-page",
+                  "name": "mobile-share",
                   "url": f"https://www.iesdouyin.com/share/video/{video_id}",
                   "ua": mobile_ua,
                   "viewport": {"width": 430, "height": 932},
@@ -100,42 +98,10 @@ jobs:
               },
           ]
 
-          media_candidates = []
+          api_responses = []
           page_records = []
           all_cookies = []
-
-          def add_candidate(url, source, content_type=""):
-              if not isinstance(url, str):
-                  return
-              url = html_lib.unescape(url).replace("\\u0026", "&").replace("\\/", "/").strip()
-              try:
-                  url = unquote(url)
-              except Exception:
-                  pass
-              if url.startswith("//"):
-                  url = "https:" + url
-              if not url.startswith(("http://", "https://")):
-                  return
-              lower = url.lower()
-              if any(ext in lower for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg")):
-                  return
-              score = 0
-              if "douyinvod" in lower or "bytevcloudvod" in lower or "douyinstatic" in lower:
-                  score += 6
-              if any(token in lower for token in ("/video/", "play_addr", "playwm", ".mp4", ".m3u8")):
-                  score += 4
-              if content_type.lower().startswith("video/"):
-                  score += 8
-              if source.startswith("dom-video"):
-                  score += 10
-              media_candidates.append(
-                  {
-                      "url": url,
-                      "source": source,
-                      "content_type": content_type,
-                      "score": score,
-                  }
-              )
+          network_media = []
 
           with sync_playwright() as p:
               browser = p.chromium.launch(
@@ -159,33 +125,53 @@ jobs:
                       is_mobile=attempt["mobile"],
                       has_touch=attempt["mobile"],
                       device_scale_factor=2 if attempt["mobile"] else 1,
-                      extra_http_headers={
-                          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-                      },
+                      extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6"},
                   )
                   context.add_init_script(
                       "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
                   )
                   page = context.new_page()
-                  network_urls = []
+                  page.set_default_timeout(5000)
 
                   def on_response(response):
                       try:
+                          url = response.url
                           content_type = response.headers.get("content-type", "")
                           resource_type = response.request.resource_type
-                          url = response.url
-                          network_urls.append(
+                          if resource_type == "media" or content_type.lower().startswith("video/"):
+                              network_media.append(
+                                  {
+                                      "attempt": attempt["name"],
+                                      "url": url,
+                                      "status": response.status,
+                                      "content_type": content_type,
+                                  }
+                              )
+
+                          relevant = (
+                              "/aweme/v1/web/aweme/detail/" in url
+                              or "/web/api/v2/aweme/post/" in url
+                              or "/web/api/v2/aweme/slidesinfo/" in url
+                          )
+                          if relevant:
+                              body = response.text()
+                              api_responses.append(
+                                  {
+                                      "attempt": attempt["name"],
+                                      "url": url,
+                                      "status": response.status,
+                                      "content_type": content_type,
+                                      "body": body,
+                                  }
+                              )
+                      except Exception as exc:
+                          api_responses.append(
                               {
-                                  "url": url,
-                                  "status": response.status,
-                                  "resource_type": resource_type,
-                                  "content_type": content_type,
+                                  "attempt": attempt["name"],
+                                  "url": getattr(response, "url", ""),
+                                  "capture_error": f"{type(exc).__name__}: {exc}",
                               }
                           )
-                          if resource_type == "media" or content_type.lower().startswith("video/"):
-                              add_candidate(url, f"network-{attempt['name']}", content_type)
-                      except Exception:
-                          pass
 
                   page.on("response", on_response)
                   record = {
@@ -194,137 +180,171 @@ jobs:
                       "final_url": "",
                       "title": "",
                       "description": "",
-                      "video_elements": [],
                       "error": "",
                   }
 
                   try:
                       page.goto(attempt["url"], wait_until="domcontentloaded", timeout=120000)
-                      page.wait_for_timeout(12000)
-                      try:
-                          page.keyboard.press("Escape")
-                      except Exception:
-                          pass
-                      try:
-                          page.mouse.wheel(0, 500)
-                          page.wait_for_timeout(2500)
-                      except Exception:
-                          pass
-
+                      page.wait_for_timeout(18000)
                       record["final_url"] = page.url
                       record["title"] = page.title()
-                      record["description"] = page.locator('meta[name="description"]').get_attribute("content") or ""
-
-                      elements = page.locator("video")
-                      for index in range(elements.count()):
-                          element = elements.nth(index)
-                          info = element.evaluate(
-                              """el => ({
-                                  src: el.getAttribute('src') || '',
-                                  currentSrc: el.currentSrc || '',
-                                  poster: el.poster || '',
-                                  readyState: el.readyState,
-                                  duration: Number.isFinite(el.duration) ? el.duration : null,
-                                  paused: el.paused
-                              })"""
-                          )
-                          record["video_elements"].append(info)
-                          add_candidate(info.get("currentSrc", ""), f"dom-video-currentSrc-{attempt['name']}")
-                          add_candidate(info.get("src", ""), f"dom-video-src-{attempt['name']}")
-                          try:
-                              element.evaluate("el => { el.muted = true; return el.play(); }")
-                          except Exception:
-                              pass
-
-                      page.wait_for_timeout(5000)
-                      for index in range(elements.count()):
-                          element = elements.nth(index)
-                          try:
-                              current_src = element.evaluate("el => el.currentSrc || el.src || ''")
-                              add_candidate(current_src, f"dom-video-after-play-{attempt['name']}")
-                          except Exception:
-                              pass
-
-                      source_elements = page.locator("video source")
-                      for index in range(source_elements.count()):
-                          src = source_elements.nth(index).get_attribute("src") or ""
-                          add_candidate(src, f"dom-source-{attempt['name']}")
-
-                      page_html = page.content()
-                      (out / f"{attempt['name']}.html").write_text(page_html, encoding="utf-8")
-                      page.screenshot(
-                          path=str(out / f"{attempt['name']}.png"),
-                          full_page=True,
-                      )
-
-                      escaped_patterns = [
-                          r'https?:\\?/\\?/[^"\'<>\s]+',
-                          r'https?://[^"\'<>\s]+',
-                      ]
-                      for pattern in escaped_patterns:
-                          for candidate in re.findall(pattern, page_html):
-                              lower = candidate.lower()
-                              if any(token in lower for token in ("douyinvod", "bytevcloudvod", ".mp4", ".m3u8", "play_addr")):
-                                  add_candidate(candidate, f"html-regex-{attempt['name']}")
-
-                  except PlaywrightTimeoutError as exc:
-                      record["error"] = f"timeout: {exc}"
+                      description = page.locator('meta[name="description"]')
+                      if description.count() > 0:
+                          record["description"] = description.first.get_attribute("content") or ""
+                      page.screenshot(path=str(out / f"{attempt['name']}.png"), full_page=True)
+                      (out / f"{attempt['name']}.html").write_text(page.content(), encoding="utf-8")
                   except Exception as exc:
                       record["error"] = f"{type(exc).__name__}: {exc}"
                   finally:
-                      (out / f"{attempt['name']}-network.json").write_text(
-                          json.dumps(network_urls, ensure_ascii=False, indent=2),
-                          encoding="utf-8",
-                      )
-                      cookies = context.cookies()
-                      all_cookies.extend(cookies)
+                      all_cookies.extend(context.cookies())
                       page_records.append(record)
                       context.close()
 
               browser.close()
 
-          dedup = {}
-          for item in media_candidates:
-              url = item["url"]
-              existing = dedup.get(url)
-              if existing is None or item["score"] > existing["score"]:
-                  dedup[url] = item
-          ordered = sorted(dedup.values(), key=lambda item: item["score"], reverse=True)
-
-          (out / "browser-pages.json").write_text(
+          (out / "page-records.json").write_text(
               json.dumps(page_records, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
-          (out / "media-candidates.json").write_text(
-              json.dumps(ordered, ensure_ascii=False, indent=2),
+          (out / "network-media.json").write_text(
+              json.dumps(network_media, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
+          (out / "api-responses.json").write_text(
+              json.dumps(api_responses, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          parsed_payloads = []
+          for index, item in enumerate(api_responses, start=1):
+              body = item.get("body", "")
+              try:
+                  payload = json.loads(body)
+              except Exception:
+                  continue
+              parsed_payloads.append(payload)
+              (out / f"api-response-{index:02d}.json").write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+
+          def find_aweme(node):
+              if isinstance(node, dict):
+                  if str(node.get("aweme_id", "")) == video_id and isinstance(node.get("video"), dict):
+                      return node
+                  for value in node.values():
+                      found = find_aweme(value)
+                      if found is not None:
+                          return found
+              elif isinstance(node, list):
+                  for value in node:
+                      found = find_aweme(value)
+                      if found is not None:
+                          return found
+              return None
+
+          aweme = None
+          for payload in parsed_payloads:
+              aweme = find_aweme(payload)
+              if aweme is not None:
+                  break
+
+          if aweme is None:
+              diagnostics = {
+                  "video_id": video_id,
+                  "parsed_payload_count": len(parsed_payloads),
+                  "api_response_count": len(api_responses),
+                  "page_records": page_records,
+              }
+              (out / "target-not-found.json").write_text(
+                  json.dumps(diagnostics, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+              print("Target aweme object was not found in captured API responses", file=sys.stderr)
+              sys.exit(2)
+
+          (out / "target-aweme.json").write_text(
+              json.dumps(aweme, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          video = aweme.get("video") or {}
+          candidate_rows = []
+
+          def normalise_url(value):
+              if not isinstance(value, str):
+                  return ""
+              value = value.replace("\\u0026", "&").replace("\\/", "/").strip()
+              try:
+                  value = unquote(value)
+              except Exception:
+                  pass
+              if value.startswith("//"):
+                  value = "https:" + value
+              return value if value.startswith(("http://", "https://")) else ""
+
+          def collect_urls(node, path="video"):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      next_path = f"{path}.{key}"
+                      if key == "url_list" and isinstance(value, list):
+                          for raw_url in value:
+                              url = normalise_url(raw_url)
+                              if not url:
+                                  continue
+                              lower_path = next_path.lower()
+                              lower_url = url.lower()
+                              score = 0
+                              if "play_addr" in lower_path:
+                                  score += 60
+                              if "play_addr_h264" in lower_path or "h264" in lower_path:
+                                  score += 18
+                              if "download_addr" in lower_path:
+                                  score += 25
+                              if "bit_rate" in lower_path:
+                                  score += 10
+                              if "h265" in lower_path or "bytevc1" in lower_path or "hevc" in lower_path:
+                                  score -= 8
+                              if "douyinvod" in lower_url or "amemv" in lower_url or "bytevcloudvod" in lower_url:
+                                  score += 12
+                              candidate_rows.append(
+                                  {
+                                      "url": url,
+                                      "path": next_path,
+                                      "score": score,
+                                  }
+                              )
+                      else:
+                          collect_urls(value, next_path)
+              elif isinstance(node, list):
+                  for index, value in enumerate(node):
+                      collect_urls(value, f"{path}[{index}]")
+
+          collect_urls(video)
+          dedup = {}
+          for row in candidate_rows:
+              existing = dedup.get(row["url"])
+              if existing is None or row["score"] > existing["score"]:
+                  dedup[row["url"]] = row
+          candidates = sorted(dedup.values(), key=lambda row: row["score"], reverse=True)
+          (out / "target-media-candidates.json").write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          if not candidates:
+              print("Target aweme was found but contained no HTTP media URL", file=sys.stderr)
+              sys.exit(3)
+
+          cookie_map = {}
+          for cookie in all_cookies:
+              name = cookie.get("name", "")
+              if name:
+                  cookie_map[name] = cookie.get("value", "")
           (out / "browser-cookies.json").write_text(
               json.dumps(all_cookies, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
-
-          cookie_map = {}
-          for cookie in all_cookies:
-              cookie_map[cookie.get("name", "")] = cookie.get("value", "")
-          cookie_header = "; ".join(f"{key}={value}" for key, value in cookie_map.items() if key)
-          (out / "cookie-header.txt").write_text(cookie_header, encoding="utf-8")
-
-          metadata = {
-              "video_id": video_id,
-              "share_url": share_url,
-              "page_records": page_records,
-              "video_url": ordered[0]["url"] if ordered else "",
-              "candidate_count": len(ordered),
-          }
-          (out / "metadata.json").write_text(
-              json.dumps(metadata, ensure_ascii=False, indent=2),
-              encoding="utf-8",
-          )
-
-          if not ordered:
-              print("No browser-rendered media URL was found", file=sys.stderr)
-              sys.exit(2)
 
           session = requests.Session()
           session.headers.update(
@@ -345,52 +365,110 @@ jobs:
               except Exception:
                   pass
 
-          failures = []
-          for index, candidate in enumerate(ordered, start=1):
+          inspections = []
+          valid_downloads = []
+          for index, candidate in enumerate(candidates[:16], start=1):
               url = candidate["url"]
-              if url.lower().endswith(".m3u8") or ".m3u8?" in url.lower():
-                  continue
+              temp_path = out / f"candidate-{index:02d}.mp4"
+              inspection = {**candidate, "index": index}
               try:
-                  with session.get(url, stream=True, timeout=(20, 120), allow_redirects=True) as response:
-                      content_type = response.headers.get("content-type", "")
-                      if response.status_code != 200:
-                          failures.append({"url": url, "status": response.status_code, "content_type": content_type})
+                  with session.get(url, stream=True, timeout=(20, 180), allow_redirects=True) as response:
+                      inspection["http_status"] = response.status_code
+                      inspection["content_type"] = response.headers.get("content-type", "")
+                      if response.status_code not in (200, 206):
+                          inspections.append(inspection)
                           continue
-                      target = out / "video.mp4"
                       size = 0
-                      with target.open("wb") as handle:
+                      with temp_path.open("wb") as handle:
                           for chunk in response.iter_content(chunk_size=1024 * 1024):
                               if chunk:
                                   handle.write(chunk)
                                   size += len(chunk)
-                      if size > 100_000:
-                          metadata["selected_candidate"] = candidate
-                          metadata["downloaded_bytes"] = size
-                          metadata["download_content_type"] = content_type
-                          (out / "metadata.json").write_text(
-                              json.dumps(metadata, ensure_ascii=False, indent=2),
-                              encoding="utf-8",
-                          )
-                          print(f"Downloaded {size} bytes from candidate {index}")
-                          sys.exit(0)
-                      target.unlink(missing_ok=True)
-                  failures.append({"url": url, "status": "too-small"})
-              except Exception as exc:
-                  failures.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+                      inspection["downloaded_bytes"] = size
 
-          (out / "download-failures.json").write_text(
-              json.dumps(failures, ensure_ascii=False, indent=2),
+                  probe = subprocess.run(
+                      [
+                          "ffprobe",
+                          "-v", "error",
+                          "-show_entries", "format=duration,size:stream=codec_type,codec_name,width,height",
+                          "-of", "json",
+                          str(temp_path),
+                      ],
+                      check=False,
+                      capture_output=True,
+                      text=True,
+                      timeout=60,
+                  )
+                  inspection["ffprobe_exit_code"] = probe.returncode
+                  if probe.returncode != 0:
+                      inspection["ffprobe_stderr"] = probe.stderr[-2000:]
+                      inspections.append(inspection)
+                      temp_path.unlink(missing_ok=True)
+                      continue
+
+                  probe_json = json.loads(probe.stdout)
+                  inspection["probe"] = probe_json
+                  streams = probe_json.get("streams") or []
+                  has_video = any(stream.get("codec_type") == "video" for stream in streams)
+                  has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+                  duration = float((probe_json.get("format") or {}).get("duration") or 0)
+                  inspection["has_video"] = has_video
+                  inspection["has_audio"] = has_audio
+                  inspection["duration"] = duration
+                  validation_score = candidate["score"] + min(duration, 300)
+                  if has_audio:
+                      validation_score += 1000
+                  if has_video:
+                      validation_score += 500
+                  inspection["validation_score"] = validation_score
+                  inspections.append(inspection)
+
+                  if has_video and duration > 3:
+                      valid_downloads.append((validation_score, temp_path, inspection))
+                  else:
+                      temp_path.unlink(missing_ok=True)
+              except Exception as exc:
+                  inspection["error"] = f"{type(exc).__name__}: {exc}"
+                  inspections.append(inspection)
+                  temp_path.unlink(missing_ok=True)
+
+          (out / "media-inspections.json").write_text(
+              json.dumps(inspections, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
-          print("Media URLs were found, but direct download failed", file=sys.stderr)
-          sys.exit(3)
+
+          if not valid_downloads:
+              print("No target media candidate passed ffprobe validation", file=sys.stderr)
+              sys.exit(4)
+
+          valid_downloads.sort(key=lambda item: item[0], reverse=True)
+          _, selected_path, selected = valid_downloads[0]
+          final_path = out / "video.mp4"
+          shutil.move(str(selected_path), final_path)
+          for _, path, _ in valid_downloads[1:]:
+              path.unlink(missing_ok=True)
+
+          metadata = {
+              "video_id": video_id,
+              "share_url": share_url,
+              "title": aweme.get("desc", ""),
+              "author": aweme.get("author", {}),
+              "create_time": aweme.get("create_time"),
+              "duration_ms": video.get("duration"),
+              "selected_media": selected,
+          }
+          (out / "metadata.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(metadata, ensure_ascii=False, indent=2))
           PY
 
-          xvfb-run -a python /tmp/extract_douyin.py 2>&1 | tee "$OUT_DIR/browser-extract.log"
+          xvfb-run -a python /tmp/capture_target.py 2>&1 | tee "$OUT_DIR/capture-target.log"
           test -s "$OUT_DIR/video.mp4"
 
           ffprobe -v error \
-            -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate \
+            -show_entries format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate \
             -of json "$OUT_DIR/video.mp4" > "$OUT_DIR/ffprobe.json"
           cat "$OUT_DIR/ffprobe.json"
 
