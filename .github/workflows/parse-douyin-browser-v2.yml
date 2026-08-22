@@ -1,0 +1,315 @@
+name: Browser extract Douyin 7675989087379761103
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/parse-douyin-browser-v2.yml"
+
+permissions:
+  contents: write
+
+env:
+  VIDEO_ID: "7675989087379761103"
+  SHARE_URL: "https://v.douyin.com/R7YR8ZKTigk/"
+  SHARE_PAGE: "https://www.iesdouyin.com/share/video/7675989087379761103/"
+  OUT_DIR: "evidence/7675989087379761103"
+  USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Prepare tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq
+          python -m pip install -q --upgrade pip
+          python -m pip install -q playwright yt-dlp requests
+          mkdir -p "$OUT_DIR/browser" "$OUT_DIR/frames"
+          if command -v google-chrome >/dev/null 2>&1; then
+            echo "CHROME_BIN=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          elif command -v chromium >/dev/null 2>&1; then
+            echo "CHROME_BIN=$(command -v chromium)" >> "$GITHUB_ENV"
+          else
+            python -m playwright install --with-deps chromium
+          fi
+
+      - name: Obtain a fresh anonymous browser session
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+
+          out = Path(os.environ["OUT_DIR"])
+          bdir = out / "browser"
+          bdir.mkdir(parents=True, exist_ok=True)
+          ua = os.environ["USER_AGENT"]
+          targets = [
+              ("home", "https://www.douyin.com/"),
+              ("short", os.environ["SHARE_URL"]),
+              ("share", os.environ["SHARE_PAGE"]),
+              ("video", f"https://www.douyin.com/video/{os.environ['VIDEO_ID']}"),
+          ]
+          observations, network = [], []
+
+          with sync_playwright() as p:
+              kwargs = {
+                  "headless": True,
+                  "args": ["--disable-dev-shm-usage", "--no-sandbox"],
+              }
+              chrome = os.environ.get("CHROME_BIN", "").strip()
+              if chrome:
+                  kwargs["executable_path"] = chrome
+              browser = p.chromium.launch(**kwargs)
+              context = browser.new_context(
+                  user_agent=ua,
+                  locale="zh-CN",
+                  timezone_id="Asia/Shanghai",
+                  viewport={"width": 1440, "height": 1000},
+                  extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"},
+              )
+              page = context.new_page()
+
+              def capture_response(response):
+                  try:
+                      url = response.url
+                      ctype = response.headers.get("content-type", "")
+                      if any(token in (url + " " + ctype).lower() for token in [
+                          "aweme", "video/tos", "video/", ".mp4", "play", "json"
+                      ]):
+                          network.append({
+                              "status": response.status,
+                              "content_type": ctype,
+                              "url": url,
+                          })
+                  except Exception:
+                      pass
+
+              page.on("response", capture_response)
+              for label, url in targets:
+                  row = {"label": label, "requested_url": url}
+                  try:
+                      response = page.goto(url, wait_until="domcontentloaded", timeout=70000)
+                      page.wait_for_timeout(10000)
+                      html = page.content()
+                      text = page.locator("body").inner_text(timeout=15000)
+                      row.update({
+                          "status": response.status if response else None,
+                          "final_url": page.url,
+                          "title": page.title(),
+                          "html_bytes": len(html.encode("utf-8")),
+                          "text_chars": len(text),
+                      })
+                      check = (html + "\n" + text).lower()
+                      row["challenge_detected"] = any(x in check for x in [
+                          "验证码", "安全验证", "访问过于频繁", "captcha", "verifycenter"
+                      ])
+                      (bdir / f"{label}.html").write_text(html, encoding="utf-8")
+                      (bdir / f"{label}.txt").write_text(text, encoding="utf-8")
+                      page.screenshot(path=str(bdir / f"{label}.png"), full_page=True)
+                  except Exception as exc:
+                      row["error"] = repr(exc)
+                  observations.append(row)
+
+              cookies = context.cookies()
+              browser.close()
+
+          cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+          (bdir / "cookie-header.txt").write_text(cookie_header, encoding="utf-8")
+          (bdir / "cookies.json").write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+          netscape = ["# Netscape HTTP Cookie File"]
+          for c in cookies:
+              domain = c.get("domain", "")
+              netscape.append("\t".join([
+                  domain,
+                  "TRUE" if domain.startswith(".") else "FALSE",
+                  c.get("path", "/"),
+                  "TRUE" if c.get("secure") else "FALSE",
+                  str(int(c.get("expires") or 0)),
+                  c["name"],
+                  c["value"],
+              ]))
+          (bdir / "cookies.txt").write_text("\n".join(netscape) + "\n", encoding="utf-8")
+          (bdir / "observations.json").write_text(json.dumps(observations, ensure_ascii=False, indent=2), encoding="utf-8")
+          dedup = []
+          seen = set()
+          for item in network:
+              if item["url"] not in seen:
+                  seen.add(item["url"])
+                  dedup.append(item)
+          (bdir / "network.json").write_text(json.dumps(dedup, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(observations, ensure_ascii=False, indent=2))
+          print(f"cookie_count={len(cookies)} network_count={len(dedup)}")
+          PY
+
+      - name: Parse metadata and download video
+        id: media
+        shell: bash
+        run: |
+          set -u -o pipefail
+          cookie_header="$(cat "$OUT_DIR/browser/cookie-header.txt" 2>/dev/null || true)"
+          media_ready=0
+
+          rm -rf /tmp/parse-video
+          git clone --depth 1 https://github.com/wujunwei928/parse-video.git /tmp/parse-video
+          set +e
+          (
+            cd /tmp/parse-video
+            PARSE_VIDEO_DOUYIN_COOKIE="$cookie_header" go run . id \
+              --source douyin --format json "$VIDEO_ID"
+          ) > "$OUT_DIR/metadata.json" 2> "$OUT_DIR/parser.stderr.txt"
+          parser_code=$?
+          set -e
+          echo "parser_exit_code=$parser_code"
+          cat "$OUT_DIR/parser.stderr.txt" || true
+          cat "$OUT_DIR/metadata.json" || true
+
+          if [ "$parser_code" -eq 0 ] && jq -e '.video_url and (.video_url | length > 0)' "$OUT_DIR/metadata.json" >/dev/null 2>&1; then
+            resolved="$(jq -r '.video_url' "$OUT_DIR/metadata.json")"
+            if curl -L --fail --retry 3 --retry-delay 2 \
+              -A "$USER_AGENT" -H "Cookie: $cookie_header" \
+              -e 'https://www.douyin.com/' "$resolved" -o "$OUT_DIR/video.mp4"; then
+              ffprobe -v error "$OUT_DIR/video.mp4" >/dev/null 2>&1 && media_ready=1
+            fi
+          fi
+
+          if [ "$media_ready" -ne 1 ]; then
+            set +e
+            yt-dlp --cookies "$OUT_DIR/browser/cookies.txt" \
+              --user-agent "$USER_AGENT" --referer 'https://www.douyin.com/' \
+              --no-playlist --write-info-json --write-thumbnail \
+              --merge-output-format mp4 -o "$OUT_DIR/video.%(ext)s" \
+              "$SHARE_URL" 2>&1 | tee "$OUT_DIR/ytdlp.log"
+            ytdlp_code=${PIPESTATUS[0]}
+            set -e
+            echo "ytdlp_exit_code=$ytdlp_code"
+            candidate="$(find "$OUT_DIR" -maxdepth 1 -type f \( -name 'video.mp4' -o -name 'video.webm' -o -name 'video.mkv' \) | head -n 1)"
+            if [ -n "$candidate" ] && ffprobe -v error "$candidate" >/dev/null 2>&1; then
+              if [ "$candidate" != "$OUT_DIR/video.mp4" ]; then
+                ffmpeg -hide_banner -loglevel error -y -i "$candidate" -c copy "$OUT_DIR/video.mp4" || cp "$candidate" "$OUT_DIR/video.mp4"
+              fi
+              media_ready=1
+            fi
+          fi
+
+          if [ "$media_ready" -ne 1 ]; then
+            python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          out = Path(os.environ["OUT_DIR"])
+          ua = os.environ["USER_AGENT"]
+          cookie = (out / "browser/cookie-header.txt").read_text(encoding="utf-8", errors="ignore")
+          source = out / "browser/network.json"
+          rows = json.loads(source.read_text(encoding="utf-8")) if source.exists() else []
+          candidates = []
+          for row in rows:
+              url = row.get("url", "")
+              ctype = row.get("content_type", "").lower()
+              if "video" in ctype or "video/tos" in url or ".mp4" in url:
+                  candidates.append(url)
+          (out / "browser/media-candidates.txt").write_text("\n".join(candidates), encoding="utf-8")
+          for i, url in enumerate(candidates[:40], 1):
+              temp = out / f"candidate-{i:02d}.bin"
+              rc = subprocess.run([
+                  "curl", "-L", "--fail", "--max-time", "120",
+                  "-A", ua, "-H", f"Cookie: {cookie}",
+                  "-e", "https://www.douyin.com/", url, "-o", str(temp)
+              ]).returncode
+              if rc != 0:
+                  temp.unlink(missing_ok=True)
+                  continue
+              if subprocess.run(["ffprobe", "-v", "error", str(temp)]).returncode == 0:
+                  temp.replace(out / "video.mp4")
+                  break
+              temp.unlink(missing_ok=True)
+          PY
+            if [ -f "$OUT_DIR/video.mp4" ] && ffprobe -v error "$OUT_DIR/video.mp4" >/dev/null 2>&1; then
+              media_ready=1
+            fi
+          fi
+
+          if [ "$media_ready" -eq 1 ]; then
+            ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate \
+              -of json "$OUT_DIR/video.mp4" > "$OUT_DIR/ffprobe.json"
+            echo "media_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "media_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract frames and audio
+        if: steps.media.outputs.media_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" -vn -ac 1 -ar 16000 "$OUT_DIR/audio.wav"
+          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" \
+            -vf "fps=1/2,scale='min(1080,iw)':-2" -q:v 2 "$OUT_DIR/frames/frame_%04d.jpg"
+          ffmpeg -hide_banner -loglevel error -y -i "$OUT_DIR/video.mp4" \
+            -vf "fps=1/3,scale=360:-2,tile=5x6:padding=8:margin=8" \
+            -frames:v 1 "$OUT_DIR/contact-sheet.jpg" || true
+
+      - name: Transcribe Chinese speech
+        if: steps.media.outputs.media_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q faster-whisper
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+          out = Path(os.environ["OUT_DIR"])
+          model = WhisperModel("small", device="cpu", compute_type="int8")
+          stream, info = model.transcribe(str(out / "audio.wav"), language="zh", vad_filter=True, beam_size=5)
+          segments = list(stream)
+          def stamp(t):
+              ms = int(round(t * 1000)); h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); s, ms = divmod(ms, 1000)
+              return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+          texts = [s.text.strip() for s in segments if s.text.strip()]
+          (out / "transcript.txt").write_text("\n".join(texts) + "\n", encoding="utf-8")
+          lines = []
+          for n, seg in enumerate(segments, 1):
+              text = seg.text.strip()
+              if text:
+                  lines += [str(n), f"{stamp(seg.start)} --> {stamp(seg.end)}", text, ""]
+          (out / "transcript.srt").write_text("\n".join(lines), encoding="utf-8")
+          (out / "transcription-meta.txt").write_text(
+              f"language={info.language}\nprobability={info.language_probability}\n", encoding="utf-8"
+          )
+          print("\n".join(texts))
+          PY
+
+      - name: Retain lightweight evidence in scratch repository
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$OUT_DIR/video.mp4" "$OUT_DIR/audio.wav" "$OUT_DIR"/candidate-*.bin
+          find "$OUT_DIR/frames" -type f | sort | awk 'NR % 3 != 1 {print}' | xargs -r rm -f
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OUT_DIR"
+          git commit -m "Retain Douyin 7675989087379761103 evidence" || true
+          git push origin HEAD:master
+
+      - name: Upload full evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: douyin-7675989087379761103-evidence-v2
+          path: evidence/7675989087379761103
+          if-no-files-found: error
+          retention-days: 3
