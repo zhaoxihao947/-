@@ -1,0 +1,42 @@
+[
+  {
+    "label": "home",
+    "requested_url": "https://www.douyin.com/",
+    "status": 200,
+    "final_url": "https://www.douyin.com/jingxuan",
+    "title": "抖音精选电脑版 - 抖音旗下优质视频平台",
+    "html_bytes": 1207468,
+    "text_chars": 2703,
+    "challenge_detected": true
+  },
+  {
+    "label": "short",
+    "requested_url": "https://v.douyin.com/R7YR8ZKTigk/",
+    "status": 200,
+    "final_url": "https://www.douyin.com/video/7675989087379761103",
+    "title": "",
+    "html_bytes": 1178414,
+    "text_chars": 1379,
+    "challenge_detected": true
+  },
+  {
+    "label": "share",
+    "requested_url": "https://www.iesdouyin.com/share/video/7675989087379761103/",
+    "status": 200,
+    "final_url": "https://www.douyin.com/video/7675989087379761103",
+    "title": "",
+    "html_bytes": 1178474,
+    "text_chars": 1353,
+    "challenge_detected": true
+  },
+  {
+    "label": "video",
+    "requested_url": "https://www.douyin.com/video/7675989087379761103",
+    "status": 200,
+    "final_url": "https://www.douyin.com/video/7675989087379761103",
+    "title": "",
+    "html_bytes": 1179457,
+    "text_chars": 1619,
+    "challenge_detected": true
+  }
+]
